@@ -29,4 +29,14 @@ val_acc: 0.6893491124260355
 all metric: {'Fusion': (0.6893491124260355, 0.7010767101986651), 'Text': (0.6168639053254438, 0.625593392750595), 'Visual': (0.34171597633136097, 0.20270919524889894), 'Audio': (0.5059171597633136, 0.5120647510412348)}
 best model save as ./checkpoint/IEMOCAP3/concat_AME/22_689_IEMOCAP3_concat_alpha1.0_gamma0.15_beta0.7_Mask-AME_dim768_M1Tok1_M2Tok1_bs64_12_29.pth
 args: Namespace(dataset='IEMOCAP3', batch_size=64, train=True, use_video_frames=3, learning_rate_visual=0.001, learning_rate_audio=0.001, learning_rate_text=0.0001, learning_rate_image=0.001, learning_rate_fusion=0.0001, optimizer='Adamw', lr_decay_step=20, lr_decay_ratio=0.1, weight_decay=0.0001, random_seed=42, fps=1, gpu_ids='0', current_epoch=1, epochs=60, Use_initWeight=False, fusion_method='concat', model_name='["Text","Visual","Audio"]', modality='full', unified_dim=768, m1_token_len=1, m2_token_len=1, num_classes=5, m1_gate=True, x_film=False, MaskType='AME', alpha=1.0, ame_gama=0.15, ame_gap=2, ame_gap_start=1, ame_beta=0.7, ame_temperature=0.2, warmup_epoch=0, Use_MACE=True, use_tensorboard=False, tensorboard_path=None, ckpt_path='./checkpoint/IEMOCAP3/concat_AME', model_save_name='concat_IEMOCAP3_with_AME', modulation='OGM_GE', ogm_alpha=0.8, modulation_starts=0, modulation_ends=50, Use_OGM=False, LFM=False)
+
+==================== 2026-01-04 14:46:47.240517 ===================
+ 
+=========================concat_CREMAD_with_AMRe==================================
+val_acc: 0.8077956989247311
+all metric: {'Fusion': (0.8077956989247311, 0.8111057358891883), 'Visual': (0.6370967741935484, 0.6303380183531702), 'Audio': (0.5913978494623656, 0.5921840746590777)}
+avg_epoch_time: 21.37s (0.36min)
+total_train_time: 1281.90s (21.37min, 0.36h)
+best model save as ./checkpoint/CREMAD/concat_AME/56_807_CREMAD_concat_alpha2.0_gamma0.15_beta0.0_Mask-AME_dim512_M1Tok1_M2Tok1_bs64_1_4.pth
+args: Namespace(dataset='CREMAD', batch_size=64, train=True, use_video_frames=3, learning_rate_visual=0.001, learning_rate_audio=0.001, learning_rate_text=1e-05, learning_rate_image=0.001, learning_rate_fusion=0.001, optimizer='Adamw', lr_decay_step=50, lr_decay_ratio=0.1, weight_decay=0.0001, random_seed=42, fps=1, gpu_ids='0', current_epoch=1, epochs=60, Use_initWeight=True, fusion_method='concat', model_name='["Visual","Audio"]', modality='full', unified_dim=512, m1_token_len=1, m2_token_len=1, num_classes=6, m1_gate=False, x_film=False, MaskType='AME', alpha=2.0, ame_gama=0.15, ame_gap=4, ame_gap_start=1, ame_beta=0.0, ame_temperature=0.2, warmup_epoch=1, Use_MACE=True, use_tensorboard=False, tensorboard_path=None, ckpt_path='./checkpoint/CREMAD/concat_AME', model_save_name='concat_CREMAD_with_AMRe', modulation='OGM_GE', ogm_alpha=0.8, modulation_starts=0, modulation_ends=50, Use_OGM=False, LFM=False)
  
