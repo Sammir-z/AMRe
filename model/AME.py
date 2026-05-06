@@ -1,132 +1,3 @@
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-
-# class AME(nn.Module):
-#     def __init__(self, args):
-#         super().__init__()
-#         self.kl = nn.KLDivLoss(reduction="none", log_target=False)
-#         # self.ce_loss = nn.BCEWithLogitsLoss(reduction="none")  # reduction=none 表示的是忽略掉batch_size维度的
-#         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
-#         self.beta = args.ame_beta
-#         self.gama = args.ame_gama
-#         self.temperature = args.ame_temperature
-#         self.un_target_D = 1/args.num_classes
-#         self.model_name = eval(args.model_name)
-
-#     def forward(self, p, q, labels=None, epoch_index=-1,epoch=-1):
-#         """
-#         一定要确保传进来的是logit
-#         """
-#         # print(f"p:{p}")
-#         # print(f"q:{q}")
-#         # print(f"self.model_name is {self.model_name} ")
-#         # print(f"self.model_name is {eval(self.model_name)} ")
-#         batch_size = p.shape[0]
-#         eps = 1e-8
-#         # ================先计算出准确度的分数====================
-#         labels = labels.long()
-#         p_score = self.ce_loss(p, labels).squeeze()
-#         q_score = self.ce_loss(q, labels).squeeze()
-
-#         # 使用softmax归一化准确度分数（BCE越小越好，取负号）
-#         acc_scores = torch.stack([p_score, q_score], dim=-1)  # [batch, 2]
-#         acc_softmax = torch.softmax(acc_scores/self.temperature, dim=-1)  # [batch, 2]
-#         p_ratio = acc_softmax[:, 0]
-#         q_ratio = acc_softmax[:, 1]
-#         # print(f"p_ratio.shape is {p_ratio.shape}")
-        
-#         # =============计算出不确定性的分数===============
-#         log_softmax_p = torch.log_softmax(p, dim=-1)
-#         log_softmax_q = torch.log_softmax(q, dim=-1)
-#         target_dis = torch.full_like(log_softmax_p, torch.tensor(self.un_target_D))
-#         P_K_softmax = self.kl(log_softmax_p, target_dis).sum(dim=-1)
-#         Q_K_softmax = self.kl(log_softmax_q, target_dis).sum(dim=-1)
-#         uncerten_socres = torch.stack([-P_K_softmax, -Q_K_softmax], dim=-1)  # [batch, 2]
-#         uncerten_softmax = torch.softmax(uncerten_socres/self.temperature, dim=-1)
-#         p_uncor_ratio = uncerten_softmax[:,0]
-#         q_uncor_ratio = uncerten_softmax[:,1]
-
-#         # =================做结合=================
-#         Image_ratio = p_ratio * self.beta + p_uncor_ratio * (1 - self.beta)
-#         Text_ratio = q_ratio * self.beta + q_uncor_ratio * (1 - self.beta)
-
-#         IT_ratio = torch.cat([Image_ratio.unsqueeze(1), Text_ratio.unsqueeze(1)], dim=-1)
-#         # 利用softmax归一化
-#         # IT_ratio = torch.softmax(IT_ratio,dim=-1)
-#         # 计算IT_ratio中两列的差异绝对值的平均值
-#         # mean_absolute_difference = torch.mean(torch.abs(IT_ratio[:, 0] - IT_ratio[:, 1]))
-#         # print(f"mean_absolute_difference is {mean_absolute_difference}")
-#         # gama = min(self.gama, mean_absolute_difference.item())
-#         gama = self.gama
-#         result = torch.ones_like(IT_ratio)
-#         for i in range(batch_size):
-#             if abs(IT_ratio[i, 0] - IT_ratio[i, 1]) >= gama:
-#                 # print(f"{i} IT argmin is {torch.argmin(IT_ratio[i])}")
-#                 result[i, torch.argmin(IT_ratio[i])] = 0
-        
-#         # =======================做输出====================
-#         if epoch_index == 0:
-#             # 确保所有张量都是1维的
-#             tensors = {
-#                 "labels": labels.squeeze(),
-#                 "p_pre": torch.softmax(p,dim=-1),
-#                 "q_pre": torch.softmax(q,dim=-1),
-#                 "p_score": p_score.squeeze(),
-#                 "q_score": q_score.squeeze(),
-#                 "p_acc_ratio": p_ratio.squeeze(),
-#                 "q_acc_ratio": q_ratio.squeeze(),
-#                 "p_unc_ratio": p_uncor_ratio.squeeze(),
-#                 "q_unc_ratio": q_uncor_ratio.squeeze(),
-#                 f"{self.model_name[0]}_final_ratio": IT_ratio[:,0].squeeze(),
-#                 f"{self.model_name[1]}_final_ratio": IT_ratio[:,1].squeeze()
-#             }
-
-#             # 打印表头 - 优化版本
-#             print("\n" + "=" * 180)
-#             print(f"{'Epoch 0 Detailed Statistics':^180}")
-#             print("=" * 180)
-#             header = (
-#                 f"{'Sample':<6} | {'Label':<6} | "
-#                 f"{self.model_name[0]+'_Prob':<12} | {self.model_name[1]+'_Prob':<12} | "
-#                 f"{self.model_name[0]+'_Loss':<12} | {self.model_name[1]+'_Loss':<12} | "
-#                 f"{self.model_name[0]+'_AccR':<12} | {self.model_name[1]+'_AccR':<12} | "
-#                 f"{self.model_name[0]+'_UncR':<12} | {self.model_name[1]+'_UncR':<12} | "
-#                 f"{self.model_name[0]+'_FinalR':<14} | {self.model_name[1]+'_FinalR':<14} | "
-#                 f"{'Decision':<12}"
-#             )
-#             print(header)
-#             print("-" * 180)
-
-#             # 打印每个样本的数据
-#             for i in range(len(tensors["p_pre"])):
-#                 label_val = int(tensors['labels'][i].item())
-#                 row = f"{i:<6} | {label_val:<6} | "
-#                 row += f"{tensors['p_pre'][i][label_val].item():<12.4f} | "
-#                 row += f"{tensors['q_pre'][i][label_val].item():<12.4f} | "
-#                 row += f"{tensors['p_score'][i].item():<12.4f} | "
-#                 row += f"{tensors['q_score'][i].item():<12.4f} | "
-#                 row += f"{tensors['p_acc_ratio'][i].item():<12.4f} | "
-#                 row += f"{tensors['q_acc_ratio'][i].item():<12.4f} | "
-#                 row += f"{tensors['p_unc_ratio'][i].item():<12.4f} | "
-#                 row += f"{tensors['q_unc_ratio'][i].item():<12.4f} | "
-#                 row += f"{tensors[f'{self.model_name[0]}_final_ratio'][i].item():<14.4f} | "
-#                 row += f"{tensors[f'{self.model_name[1]}_final_ratio'][i].item():<14.4f} | "
-
-#                 # 添加决策列
-#                 decision = "None"
-#                 if result[i, 1] == 0:
-#                     decision = self.model_name[1]
-#                 elif result[i, 0] == 0:
-#                     decision = self.model_name[0]
-#                 row += f"{decision:<12}"
-
-#                 print(row)
-
-#             print("\n" + "=" * 180)
-
-#         return result.bool(), IT_ratio
-    
 
 # =============================任意数量模态融合================================
 import torch
@@ -136,16 +7,67 @@ import torch.nn.functional as F
 class AME(nn.Module):
     def __init__(self, args):
         super().__init__()
+        self.args = args
         self.kl = nn.KLDivLoss(reduction="none", log_target=False)
         # self.ce_loss = nn.BCEWithLogitsLoss(reduction="none")  # reduction=none 表示的是忽略掉batch_size维度的
         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
+        # 用于“准确性打分”的指标：precision 或 f1（默认 precision）。
+        # 样本级（single-label multiclass）下，precision/F1 的软版本可用 p_true 近似。
+        self.acc_metric = getattr(args, 'ame_acc_metric', 'ce_loss')
+        self.unc_metric = getattr(args, 'ame_unc_metric', 'kl')
         self.beta = args.ame_beta
         self.gama = args.ame_gama
         self.temperature = args.ame_temperature
+        # self.temperature = 1.0
         self.un_target_D = 1/args.num_classes
         self.model_name = eval(args.model_name)
 
-    def forward(self, *modalities, labels=None, epoch_index=-1, epoch=-1):
+
+    def _per_sample_acc_score(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Compute sample-level accuracy score for masking.
+
+        Supported metrics (self.acc_metric):
+        - 'precision' (default): 1 - p_true. Simple probability gap.
+        - 'margin': 1 - (p_true - p_runner_up). Penalizes confusion with other classes.
+        - 'brier': Mean Squared Error between prob distribution and one-hot label.
+        - 'ce_loss': Cross Entropy Loss.
+        """
+        labels = labels.long()
+        probs = torch.softmax(logits, dim=-1)
+        batch_size = labels.size(0)
+        
+        # 1. Get probability of the true class
+        p_true = probs[torch.arange(batch_size, device=logits.device), labels]
+
+        if self.acc_metric == 'margin':
+            # Margin = p_true - max(p_others)
+            # Clone probs and mask out true class to find max of remainder
+            # print(f"use margin")
+            
+            probs_clone = probs.clone()
+            probs_clone[torch.arange(batch_size, device=logits.device), labels] = -1.0 # eliminate true class
+            p_max_other, _ = probs_clone.max(dim=-1)
+            
+            # margin range is [-1, 1]. 
+            # We map it to a loss-like score: 1 - margin.
+            # Best case (1.0 margin) -> 0.0 score. Worst case (-1.0 margin) -> 2.0 score.
+            margin = p_true - p_max_other
+            score = 1.0 - margin
+
+
+        elif self.acc_metric == 'ce_loss':
+            # Cross Entropy Loss
+            score = self.ce_loss(logits, labels)
+            # print(f"use ce_loss")
+            
+        else: # default to 'precision' equivalent (1 - p_true)
+            score = self.ce_loss(logits, labels)
+            
+        return score
+
+
+        
+    def forward(self, *modalities, fusion_logits=None, labels=None, epoch_index=-1, epoch=-1):
         """
         接受任意数量的模态作为输入，每个模态都是一个logit张量。
         """
@@ -155,62 +77,41 @@ class AME(nn.Module):
         num_modalities = len(modalities)
         batch_size = modalities[0].shape[0]
         device = modalities[0].device
-        eps = 1e-8
+        # eps = 1e-8
         
         # ================ 1. 计算准确度分数 ====================
         labels = labels.long()
         # 计算每个模态的交叉熵损失
-        acc_scores_list = [self.ce_loss(m, labels).squeeze() for m in modalities]
+        acc_scores_list = [self._per_sample_acc_score(m, labels).squeeze() for m in modalities]
         acc_scores = torch.stack(acc_scores_list, dim=-1)  # Shape: [batch, num_modalities]
-
-        # 对损失进行softmax得到准确度比例（损失越大，比例越高）
+        eps = 1e-4
+        # 生成和 acc_scores 同维度的 eps 张量
+        eps_f = torch.full_like(acc_scores, eps)  # 关键代码
         acc_softmax = torch.softmax(acc_scores / self.temperature, dim=-1)  # Shape: [batch, num_modalities]
-
-        # ============= 2. 计算不确定性分数 ===============
-        log_softmax_modalities = [torch.log_softmax(m, dim=-1) for m in modalities]
         
-        # 目标均匀分布
-        target_dis = torch.full_like(log_softmax_modalities[0], self.un_target_D)
-        # print(f"target_dis is {target_dis}")
-        # 计算每个模态与均匀分布的KL散度作为不确定性
-        kl_divs = [self.kl(log_m, target_dis).sum(dim=-1) for log_m in log_softmax_modalities]
-        uncerten_scores = torch.stack(kl_divs, dim=-1)  # Shape: [batch, num_modalities]
-        # print(f"kl_divs is {kl_divs}")
-        # print(f"uncerten_scores is {uncerten_scores}")
-        # 对不确定性分数进行softmax（KL散度越大，不确定性越高，分数越低）
-        uncerten_softmax = torch.softmax(-uncerten_scores / self.temperature, dim=-1) # Shape: [batch, num_modalities]
-        # print(f"uncerten_softmax is {uncerten_softmax}")
+        # ============= 2. 计算不确定性分数 ===============
+        
+        if self.unc_metric == 'kl':
+            # 目标均匀分布
+            log_softmax_modalities = [torch.log_softmax(m, dim=-1) for m in modalities]
+            target_dis = torch.full_like(log_softmax_modalities[0], self.un_target_D)
+            # print(f"target_dis is {target_dis}")
+            # 计算每个模态与均匀分布的KL散度作为不确定性
+            kl_divs = [-self.kl(log_m, target_dis).sum(dim=-1) for log_m in log_softmax_modalities]
+            uncerten_scores = torch.stack(kl_divs, dim=-1)  # Shape: [batch, num_modalities]
+        elif self.unc_metric == 'entropy':
+            # 使用负信息熵
+            # print(f"use entropy")
+            prob_modalities = [torch.softmax(m, dim=-1) for m in modalities]
+            uncerten_scores = torch.stack(
+                [-(p * torch.log(p.clamp_min(1e-12))).sum(dim=-1) for p in prob_modalities],
+                dim=-1,
+            )  # [B, M]
 
-        # ================= 3. 结合准确度与不确定性 =================
-        # 使用beta进行加权平均
+        uncerten_softmax = torch.softmax(uncerten_scores / self.temperature, dim=-1) # Shape: [batch, num_modalities]
+
+        eps = 1e-8
         final_ratios = acc_softmax * self.beta + uncerten_softmax * (1 - self.beta) # Shape: [batch, num_modalities]
-
-        # # ================= 4. 生成掩码 =================
-        # # 新逻辑：在样本级别进行细粒度掩码
-        # gama = self.gama
-
-        # # 1. 对每个样本，计算其模态得分的最大和最小差异
-        # max_scores, _ = torch.max(final_ratios, dim=-1)
-        # min_scores, _ = torch.min(final_ratios, dim=-1)
-        # diffs = max_scores - min_scores # Shape: [batch]
-
-        # # 2. 确定哪些样本需要被掩码（差异大于等于gama）
-        # samples_to_mask = diffs >= gama # Shape: [batch], boolean tensor
-        # if epoch_index<=5:
-        #     diffs_mean = diffs.mean()
-        #     diffs_median = diffs.median()
-        #     print(f"mean is {diffs_mean.item()} median is {diffs_median.item()}")
-        # # 3. 生成基础的“赢家通吃”掩码
-        # # 首先，为所有样本创建一个全零掩码
-        # winner_mask = torch.zeros_like(final_ratios)
-        # # 找到每个样本最高分的模态索引
-        # max_score_indices = torch.argmax(final_ratios, dim=-1)
-        # # 将最高分模态的位置设置为1
-        # winner_mask.scatter_(dim=1, index=max_score_indices.unsqueeze(1), value=1)
-
-        # # 4. 根据条件选择最终掩码
-        # # 如果 `samples_to_mask` 中对应位置为True，则使用 `winner_mask`；否则，使用全1掩码
-        # result = torch.where(samples_to_mask.unsqueeze(1), winner_mask, torch.ones_like(final_ratios))
         # # ================= 4. 生成掩码 =================
         # 新逻辑：仅 mask 每个样本中得分最低的模态
         gama = self.gama
@@ -222,6 +123,8 @@ class AME(nn.Module):
         
         # 2) 需要掩码的样本（差异 >= gama）
         samples_to_mask = diffs >= gama  # [batch] bool
+        # samples_to_mask = (diffs >= gama) & (diffs < 0.9)  # [batch] bool
+
         # if epoch_index<=5:
         #     diffs_mean = diffs.mean()
         #     diffs_median = diffs.median()
@@ -229,6 +132,7 @@ class AME(nn.Module):
         # 3) 生成仅屏蔽最低分模态的掩码
         # 先做全 1，再把最低分索引位置置 0
         min_score_indices = torch.argmin(final_ratios, dim=-1)  # [batch]
+        # min_score_indices = torch.argmax(final_ratios, dim=-1)  # [batch]
         one_hot_min = torch.zeros_like(final_ratios)
         one_hot_min.scatter_(dim=1, index=min_score_indices.unsqueeze(1), src=torch.ones_like(min_score_indices, dtype=final_ratios.dtype).unsqueeze(1))
         loser_mask = torch.ones_like(final_ratios) - one_hot_min  # 该掩码仅在最低分位置为 0，其余为 1
@@ -245,6 +149,8 @@ class AME(nn.Module):
                 ("UncR", lambda t, i, _: t[i].item()),
                 ("FinalR", lambda t, i, _: t[i].item()),
             ]
+            # if fusion_logits is not None:
+            #     metrics_info.append(("MI", lambda t, i, _: t[i].item()))
             modal_metrics = {}
             for idx, modality in enumerate(modalities):
                 mod_name = self.model_name[idx]
@@ -255,6 +161,8 @@ class AME(nn.Module):
                 modal_metrics[mod_name]["AccR"] = acc_softmax[:, idx]
                 modal_metrics[mod_name]["UncR"] = uncerten_softmax[:, idx]
                 modal_metrics[mod_name]["FinalR"] = final_ratios[:, idx]
+                # if fusion_logits is not None:
+                #     modal_metrics[mod_name]["MI"] = mi_modal_pred[:, idx]
 
             print("\n" + "=" * 200)
             print(f"{'Epoch 0 Detailed Statistics':^200}")
@@ -287,6 +195,8 @@ class AME(nn.Module):
                 print(row)
 
             print("\n" + "=" * (len(header) + 4))
+        # if 0<epoch_index<=2:
+        #     print(f"current_beta is {current_beta}")
         return result.bool(), final_ratios
     
 #================Shapley 计算==================
@@ -338,39 +248,19 @@ class Shapley(nn.Module):
                 
                 shapley_m1 = 0.5 * (modal_values[0] - value_empty) + 0.5 * (value_all - modal_values[1])
                 shapley_m2 = 0.5 * (modal_values[1] - value_empty) + 0.5 * (value_all - modal_values[0])
-                # if i == 0 and epoch_index>10:
-                #     print(f"shapley_m1: {shapley_m1}, shapley_m2:{shapley_m2}")
-                # # 累计 Shapley 值用于统计
-                # cona += shapley_m1
-                # conv += shapley_m2
-                
-                # 基于 Shapley 值决定 mask
-                # # Shapley 值越大，说明该模态贡献越大，应该 mask 掉（让弱模态得到更多训练）
-                # if shapley_m1 > shapley_m2:
-                #     m1_Mask[i] = 0.0
-                # elif shapley_m1 < shapley_m2:
-                #     m2_Mask[i] = 0.0
-                # Shapley 值越大，说明该模态贡献越大，应该 mask 掉（让弱模态得到更多训练）
+
                 if shapley_m1 < shapley_m2:
                     m1_Mask[i] = 0.0
                 elif shapley_m1 > shapley_m2:
                     m2_Mask[i] = 0.0   
             elif num_modalities == 3:
-                # 三模态 Shapley 值计算（需要计算所有子集）
-                # 为简化，这里使用两两组合的价值
-                # 注意：完整的 Shapley 值需要计算所有 2^3 = 8 个子集
-                
+
                 # 假设我们只有单模态和全模态的输出
                 # 简化版 Shapley 值估计：
                 shapley_m1 = (modal_values[0] - value_empty) / 3.0 + (value_all - (modal_values[1] + modal_values[2]) / 2.0) / 3.0
                 shapley_m2 = (modal_values[1] - value_empty) / 3.0 + (value_all - (modal_values[0] + modal_values[2]) / 2.0) / 3.0
                 shapley_m3 = (modal_values[2] - value_empty) / 3.0 + (value_all - (modal_values[0] + modal_values[1]) / 2.0) / 3.0
-                
-                # # 累计 Shapley 值用于统计
-                # cont += shapley_m1
-                # conv += shapley_m2
-                # cona += shapley_m3
-                
+
                 # 找出 Shapley 值最大的模态并 mask（让弱模态得到更多训练）
                 shapley_values = [shapley_m1, shapley_m2, shapley_m3]
                 max_idx = shapley_values.index(max(shapley_values))

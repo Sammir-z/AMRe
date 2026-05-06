@@ -31,7 +31,6 @@ from dataset.Mydataset import CramedDataset,AVEDataset,KSDataset
 from utils.metrics import calculate_metrics
 from utils.utils import setup_seed,weight_init,print_model_params,print_current_lrs
 from utils.utils import Alignment,getAlpha_Learnable_Fitted # For LFM
-from utils.feature_extractor import FeatureCollector
 
 def get_arguments():
     parser = argparse.ArgumentParser()
@@ -57,12 +56,13 @@ def get_arguments():
     parser.add_argument('--current_epoch', type=int, default=1,help="Start train epoch number")
     parser.add_argument('--epochs', default=100, type=int, help='Number of training epochs')
     parser.add_argument('--Use_initWeight', default=False, type=bool, help='Use weight init model')
+    parser.add_argument('--mask_percent', default=0, type=float, help='mask data percent')
     
 
     # 模型设置
     parser.add_argument('--fusion_method', default='concat', type=str,choices=['sum', 'concat', 'Gate', 'Film', 'MMTM', 'CA', 'CentralNet'], help='Fusion method to combine modalities')
     parser.add_argument('--model_name', default='["Visual","Audio"]', type=str, choices=['["Visual","Audio"]', '["Image","Text"]', '["Text","Visual","Audio"]'])
-    parser.add_argument('--modality',default='full',type=str,choices=['full','audio','visual'],help='modality to use')
+    parser.add_argument('--modality',default='full',type=str,choices=['full','Audio','Visual','Image','Text'],help='modality to use')
     parser.add_argument('--unified_dim', default=512, type=int, help='Unified feature dimension after encoders')
     parser.add_argument('--m1_token_len', default=1, type=int, help='Modality 1 (e.g., visual) token length')
     parser.add_argument('--m2_token_len', default=1, type=int, help='Modality 2 (e.g., audio or text) token length')
@@ -71,7 +71,7 @@ def get_arguments():
     parser.add_argument('--x_film', default=False, type=bool, help='For Film Model, whether to use modality 1 film')
 
     # AME相关参数
-    parser.add_argument('--MaskType', default='None', type=str, choices=['None', 'AME','Shapley'], help='Type of masking strategy')
+    parser.add_argument('--MaskType', default='None', type=str, choices=['None', 'AME','Shapley','AME_attention','AME_DynamicBetaSoftGate','Random'], help='Type of masking strategy')
     parser.add_argument('--alpha', default=1.0, type=float, help='Alpha parameter for AME module')
     parser.add_argument('--ame_gama', default=0.1, type=float, help='Gamma parameter for AME module')
     parser.add_argument('--ame_gap', default=2, type=int, help='restoration gap')
@@ -80,12 +80,18 @@ def get_arguments():
     parser.add_argument('--ame_temperature', default=0.2, type=float, help='Temperature parameter for AME module')
     parser.add_argument('--warmup_epoch', default=0, type=int, help='Number of warmup epochs before applying AME')
     parser.add_argument('--Use_MACE',default=True, type=bool, help="是否使用MACE loss")
+    parser.add_argument('--random_mask_drop_prob',default=0.3, type=float, help="随机掩码的比例")
+    parser.add_argument('--ame_acc_metric',default='ce_loss', type=str, help="准确性的评价指标")
+    parser.add_argument('--ame_unc_metric',default='kl', type=str, help="确定性的评价指标")
+    
+    
     # tensorboard相关参数
     parser.add_argument('--use_tensorboard', default=False, type=bool, help='whether to visualize')
     parser.add_argument('--tensorboard_path', type=str, help='path to save tensorboard logs')
     # 保存模型的相关参数
     parser.add_argument('--ckpt_path', required=True, type=str, help='path to save trained models')
     parser.add_argument("--model_save_name",required=True,type=str,help='model save log name')
+    parser.add_argument('--pretrained_model_path', default='', type=str, help='Path to a pretrained model for evaluation or fine-tuning')
     # OGM-GE 模型相关参数
     parser.add_argument('--modulation', default='OGM_GE', type=str, choices=['OGM', 'OGM_GE'], help='Modulation strategy to use')
     parser.add_argument('--ogm_alpha', default=0.8, type=float, help='Alpha parameter for OGM modulation')
@@ -95,19 +101,14 @@ def get_arguments():
     
     # LFM相关参数
     parser.add_argument('--LFM', default=False, type=bool, help='Whether to use LFM method')
+    parser.add_argument('--unimodal_use', default=None, type=str, help='Use unimodal train')
     
-    # 特征可视化相关参数
-    parser.add_argument('--save_features', default=False, type=bool, help='Whether to save features for visualization')
-    parser.add_argument('--feature_save_dir', type=str, default=None, help='Directory to save features')
-    parser.add_argument('--feature_save_epochs', type=int, nargs='+', default=[0, 10, 20, 40, 70, 90], 
-                       help='Epochs to save features')
     
     args = parser.parse_args()
     return args
 
 
-def train_epoch(args, epoch, model, device, dataloader, optimizer_m1, optimizer_m2, optimizer_fusion, 
-                optimizer_m3=None, scheduler_map=None, feature_collector=None):
+def train_epoch(args, epoch, model, device, dataloader, optimizer_m1, optimizer_m2, optimizer_fusion, optimizer_m3=None,scheduler_map=None):
     criterion = nn.CrossEntropyLoss(reduction='none')
     model.train()
     cls_k = None
@@ -120,10 +121,6 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer_m1, optimizer_
     modal_acc_lists = [[] for _ in range(num_modalities)]
     modal_f1_lists = [[] for _ in range(num_modalities)]
     modal_loss_sums = [0.0 for _ in range(num_modalities)]
-    
-    # 特征收集标志
-    should_collect_features = (feature_collector is not None and 
-                               epoch in args.feature_save_epochs)
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs} [Training]")
     for step, data_packet in enumerate(pbar):
@@ -173,16 +170,6 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer_m1, optimizer_
         fusion_logits = outputs[0]
         modal_logits = list(outputs[1:1 + num_modalities])
         extra = list(outputs[1 + num_modalities:])
-        
-        # 收集特征用于可视化（从模型缓存读取features）
-        if should_collect_features:
-            if hasattr(model.fusion_model, 'cached_fusion_feature') and model.fusion_model.cached_fusion_feature is not None:
-                feature_collector.collect_features(
-                    epoch=epoch,
-                    fusion_features=model.fusion_model.cached_fusion_feature,
-                    modality_features=[model.fusion_model.cached_m1_feature, model.fusion_model.cached_m2_feature],
-                    labels=label
-                )
 
         masks = []
         if extra:
@@ -379,11 +366,6 @@ def train_epoch(args, epoch, model, device, dataloader, optimizer_m1, optimizer_
     for name in modal_names:
         acc, f1 = modal_avg_metrics.get(name, (0.0, 0.0))
         print(f"  {name} -> Accuracy: {acc:.4f}, F1-Score: {f1:.4f}")
-    
-    # 保存该epoch的特征
-    if should_collect_features:
-        print(f"\nSaving features for epoch {epoch}...")
-        feature_collector.save_epoch_features(epoch)
 
     return (avg_acc_fusion, avg_f1_fusion), modal_avg_metrics, MaskNumber
 
@@ -617,14 +599,6 @@ def main():
         writer.writerow(['Epoch', 'Val_Acc', 'Val_F1', *modal_header])
     # ==================训练和验证=====================================
     if args.train:
-        # 初始化特征收集器
-        feature_collector = None
-        if args.save_features:
-            if args.feature_save_dir is None:
-                args.feature_save_dir = os.path.join(args.ckpt_path, 'features')
-            feature_collector = FeatureCollector(args.feature_save_dir, modal_names)
-            print(f"\n特征收集器已启用，将在以下epochs保存特征: {args.feature_save_epochs}")
-        
         best_acc = 0.0
         save_path = None
         val_metrics = {'acc':-1,'f1':-1,'acc_a':-1,'f1_a':-1,'acc_v':-1,'f1_v':-1}
@@ -641,8 +615,7 @@ def main():
                 optimizer_m2=optimizer_m2,
                 optimizer_fusion=optimizer_fusion,
                 optimizer_m3=optimizer_m3,
-                scheduler_map=scheduler_map,
-                feature_collector=feature_collector
+                scheduler_map=scheduler_map, 
             )
             if scheduler_map != None:
                 for sch in scheduler_map:
@@ -686,19 +659,27 @@ def main():
                     mask_number = Mask_Number[f"{name}_mask_number"]
                     row.extend([acc_modal, f1_modal, mask_number])
                 writer.writerow(row)
-        # with open(f"Results/results-AME-{args.dataset}-{args.fusion_method}.log", "a") as f:
-        with open(f"Results/results-AMRe-{args.fusion_method}.log", "a") as f:
-            f.write(
-                f"==================== {datetime.datetime.now()} ===================\n \n"
-            )
-            f.write(f"========================={args.model_save_name}==================================\n")
-            f.write(f"val_acc: {best_acc}\n")
-            f.write(f"all metric: {val_metrics}\n")
-            f.write(f"best model save as {save_path}\n")
-            f.write(f"args: {args}\n \n")
-        print(f"val best metrics is {val_metrics} \n")
-        print(f"best model save as {save_path} \n")
-        print(f"args:{args} \n \n")
+    else:
+        loaded_dict = torch.load(args.pretrained_model_path, map_location=device)
+        model.load_state_dict(loaded_dict)
+        print(f"Loaded pretrained model from {args.pretrained_model_path}")
+        val_fusion_metrics, val_modal_metrics = valid(args, model, device, test_dataloader)
+        best_acc = val_fusion_metrics[0]
+        val_metrics = {'Fusion': val_fusion_metrics, **val_modal_metrics}
+        save_path = args.pretrained_model_path
+    # with open(f"Results/results-AME-{args.dataset}-{args.fusion_method}.log", "a") as f:
+    with open(f"Results/results-AMRe-{args.fusion_method}.log", "a") as f:
+        f.write(
+            f"==================== {datetime.datetime.now()} ===================\n \n"
+        )
+        f.write(f"========================={args.model_save_name}==================================\n")
+        f.write(f"val_acc: {best_acc}\n")
+        f.write(f"all metric: {val_metrics}\n")
+        f.write(f"best model save as {save_path}\n")
+        f.write(f"args: {args}\n \n")
+    print(f"val best metrics is {val_metrics} \n")
+    print(f"best model save as {save_path} \n")
+    print(f"args:{args} \n \n")
     # scheduler_m1 = get_scheduler(optimizer_m1, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps)
     # scheduler_m2 = get_scheduler(optimizer_m2, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps)
     # scheduler_fusion = get_scheduler(optimizer_fusion, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps)

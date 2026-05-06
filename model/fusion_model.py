@@ -1,3 +1,10 @@
+# import os
+# import sys
+# # 获取当前文件所在目录
+# current_dir = os.path.dirname(os.path.abspath(__file__))
+# # 添加到sys.path
+# sys.path.insert(0, current_dir)
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,6 +17,65 @@ from positional_encodings.torch_encodings import PositionalEncoding1D
 
 from .AME import AME, Shapley
 from .utils import CoAttentionExpert
+from .AME_Attention_Fusion import AME_AttentionFusion
+from .AME_DynamicBetaSoftGate import AME_DynamicBetaSoftGate
+from .opm import ModalityDropper
+
+
+
+def _sample_random_modality_masks(
+    batch_size: int,
+    num_modalities: int,
+    drop_prob: float,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    generator=None,
+) -> torch.Tensor:
+    """Sample per-sample modality masks with random dropping.
+
+    Returns a (B, M) tensor in {0,1} (float dtype) where 1 means keep.
+    Guarantee: each sample keeps at least one modality.
+    """
+    if num_modalities <= 0:
+        raise ValueError(f"num_modalities must be positive, got {num_modalities}")
+
+    # Fast path: keep all.
+    if drop_prob <= 0.0:
+        return torch.ones(batch_size, num_modalities, device=device, dtype=dtype)
+
+    # If drop_prob>=1, keep exactly one random modality per sample.
+    if drop_prob >= 1.0:
+        if generator is None:
+            keep = torch.zeros(batch_size, num_modalities, device=device, dtype=dtype)
+            idx = torch.randint(0, num_modalities, (batch_size,), device=device)
+            keep[torch.arange(batch_size, device=device), idx] = 1.0
+            return keep
+        keep_cpu = torch.zeros(batch_size, num_modalities, device='cpu', dtype=dtype)
+        idx_cpu = torch.randint(0, num_modalities, (batch_size,), device='cpu', generator=generator)
+        keep_cpu[torch.arange(batch_size, device='cpu'), idx_cpu] = 1.0
+        return keep_cpu.to(device=device, dtype=dtype)
+
+    if generator is None:
+        keep = (torch.rand(batch_size, num_modalities, device=device) > drop_prob).to(dtype)
+        all_dropped = keep.sum(dim=1) == 0
+        if all_dropped.any():
+            rows = all_dropped.nonzero(as_tuple=False).squeeze(1)
+            idx = torch.randint(0, num_modalities, (rows.numel(),), device=device)
+            keep[rows] = 0
+            keep[rows, idx] = 1.0
+        return keep
+
+    # Reproducible path: sample on CPU with an isolated generator, then move to target device.
+    keep_cpu = (torch.rand(batch_size, num_modalities, device='cpu', generator=generator) > drop_prob).to(dtype)
+    all_dropped_cpu = keep_cpu.sum(dim=1) == 0
+    if all_dropped_cpu.any():
+        rows_cpu = all_dropped_cpu.nonzero(as_tuple=False).squeeze(1)
+        idx_cpu = torch.randint(0, num_modalities, (rows_cpu.numel(),), device='cpu', generator=generator)
+        keep_cpu[rows_cpu] = 0
+        keep_cpu[rows_cpu, idx_cpu] = 1.0
+    return keep_cpu.to(device=device, dtype=dtype)
+
+
 
 class base_model(nn.Module):
     def __init__(self, args):
@@ -19,6 +85,26 @@ class base_model(nn.Module):
         self.outdim = args.num_classes
         self.args = args
         self.model_name = eval(args.model_name)
+        self.use_OLA = getattr(args, 'Use_OLA', False)
+        # Priority: args.random_mask_seed > args.random_seed > 0
+        self._random_mask_gen = torch.Generator(device='cpu')
+        seed = int(getattr(args, 'random_mask_seed', getattr(args, 'random_seed', 2026)))
+        self._random_mask_gen.manual_seed(seed)
+
+        # OPM
+        self.model_name = eval(args.model_name)
+        self.latest_drop_info = None
+        self.opm_controller = None
+        if getattr(args, 'use_opm', False) and len(self.model_name) >= 2:
+            self.opm_controller = ModalityDropper(
+                num_modalities=len(self.model_name),
+                execute_prob=getattr(args, 'opm_execute_prob', 0.7),
+                q_base=getattr(args, 'opm_q_base', 0.5),
+                lam=getattr(args, 'opm_lambda', 0.5),
+                min_keep=getattr(args, 'opm_min_keep', 1),
+                seed=getattr(args, 'opm_seed', 2024),
+            )
+        
         # 注册Mask Number 的buffer
         self.register_buffer('m1_mask_num', torch.tensor(0.0)) # 代表视觉类
         self.register_buffer('m2_mask_num', torch.tensor(0.0)) # 代表文本类
@@ -31,12 +117,29 @@ class base_model(nn.Module):
         self.MaskType = args.MaskType
         if self.MaskType == "None":
             self.Mask = None
+        elif self.MaskType == "Random":
+            # Random modality dropping; no extra module required.
+            self.Mask = None
         elif self.MaskType == "AME":
             self.Mask = AME(args=args)
+        elif self.MaskType == "AME_attention":
+            self.Mask = AME_AttentionFusion(args=args)
+        elif self.MaskType == "AME_DynamicBetaSoftGate":
+            self.Mask = AME_DynamicBetaSoftGate(args=args)
         elif self.MaskType == "Shapley":
             self.Mask = Shapley(args=args)
         else:
             self.Mask = None
+        # self.m1_classifier = nn.Sequential(
+        #     nn.Linear(self.unified_dim, self.outdim),
+        #     nn.SiLU(),
+            
+        # )
+        # self.m2_classifier = nn.Sequential(
+        #     nn.Linear(self.unified_dim, 64),
+        #     nn.SiLU(),
+            
+        # )
         self.m1_classifier = nn.Sequential(
             nn.Linear(self.unified_dim, 64),
             nn.SiLU(),
@@ -47,6 +150,12 @@ class base_model(nn.Module):
             nn.SiLU(),
             nn.Linear(64, self.outdim)
         )
+        # self.m1_classifier = nn.Sequential(
+        #     nn.Linear(self.unified_dim, self.outdim)
+        # )
+        # self.m2_classifier = nn.Sequential(
+        #     nn.Linear(self.unified_dim, self.outdim)
+        # )
         # 存储Mask的状态
         self.Mask_Dict_m1 = defaultdict(lambda: torch.tensor(1, device='cuda:0'))
         self.Mask_Dict_m2 = defaultdict(lambda: torch.tensor(1, device='cuda:0'))
@@ -55,23 +164,61 @@ class base_model(nn.Module):
         self.cached_m1_feature = None
         self.cached_m2_feature = None
         
+    
+    def AME_MASK(self, epoch, batch_size, m1_feature, m2_feature, device, labels=None, epoch_index=-1, fusion_logits=None, sid=None, m1_only_output=None, m2_only_output=None):
+        # OPM
+        drop_info = None
+        if (
+            self.opm_controller is not None
+            and self.training
+            and labels is not None
+            and epoch > self.args.warmup_epoch
+        ):
+            raw_features = [m1_feature, m2_feature]
+            with torch.no_grad():
+                logits_for_drop = [
+                    self.m1_classifier(raw_features[0].detach()),
+                    self.m2_classifier(raw_features[1].detach())
+                ]
+            dropped_features, drop_info = self.opm_controller(raw_features, logits_for_drop, labels)
+            m1_feature, m2_feature = dropped_features
+        self.latest_drop_info = drop_info
         
-    def AME_MASK(self, epoch, batch_size, m1_feature, m2_feature, device, labels=None, epoch_index=-1, fusion_logits=None, sid=None):
         m1_Mask =torch.ones(batch_size, device=device)
         m2_Mask =torch.ones(batch_size, device=device)
         # 生成Mask
         # 训练弱模态
         # if epoch > self.args.warmup_epoch and self.Mask is not None and epoch%3==2:
         # if epoch > self.args.warmup_epoch and self.Mask is not None and epoch%self.gap != self.gap_start:
-        if epoch > self.args.warmup_epoch and self.Mask is not None and epoch%self.gap != 1:
+        # if epoch > self.args.warmup_epoch and self.Mask is not None and epoch%self.gap != 1:
+        if epoch > self.args.warmup_epoch and self.MaskType != "None" and epoch % self.gap != 1:
         # if epoch > self.args.warmup_epoch and self.Mask is not None:
-            with torch.no_grad():
-                m1_only_output = self.m1_classifier(m1_feature)
-                m2_only_output = self.m2_classifier(m2_feature)
+            if self.MaskType == 'Random':
+                drop_prob = float(getattr(self.args, 'random_mask_drop_prob', 0.0))
+                masks = _sample_random_modality_masks(
+                    batch_size=batch_size,
+                    num_modalities=2,
+                    drop_prob=drop_prob,
+                    device=device,
+                    dtype=m1_feature.dtype,
+                    generator=self._random_mask_gen,
+                )
+                m1_Mask = masks[:, 0]
+                m2_Mask = masks[:, 1]
+            # else:
+            #     with torch.no_grad():
+            #         m1_only_output = self.m1_classifier(m1_feature)
+            #         m2_only_output = self.m2_classifier(m2_feature)
+                    # fusion_logit = self.
+            if m1_only_output is None:
+                with torch.no_grad():
+                    m1_only_output = self.m1_classifier(m1_feature)
+                    m2_only_output = self.m2_classifier(m2_feature)
             if self.MaskType == 'AME':
                 kl_result,IT_gsd = self.Mask(
                     m1_only_output,
                     m2_only_output,
+                    fusion_logits=fusion_logits,
                     labels=labels,
                     epoch_index=epoch_index,
                     epoch=epoch
@@ -79,6 +226,17 @@ class base_model(nn.Module):
                 # 计算掩码值
                 m1_Mask = kl_result[:,0]
                 m2_Mask = kl_result[:,1]
+
+            elif self.MaskType == 'AME_attention':
+                weights, stats = self.Mask(
+                    m1_only_output,
+                    m2_only_output,
+                    labels=labels,
+                    epoch_index=epoch_index,
+                    epoch=epoch
+                )
+                m1_Mask = weights[:,0]
+                m2_Mask = weights[:,1]
             
             elif self.MaskType == 'Shapley':
                 m1_Mask, m2_Mask = self.Mask(
@@ -95,14 +253,29 @@ class base_model(nn.Module):
                 m2_Mask = m2_Mask.squeeze(1)
        
     
-            self.m1_mask_num += (batch_size - m1_Mask.sum().item())
-            self.m2_mask_num += (batch_size - m2_Mask.sum().item())
+            # self.m1_mask_num += (batch_size - m1_Mask.sum().item())
+            # self.m2_mask_num += (batch_size - m2_Mask.sum().item())
     
-            m1_feature_masked = m1_Mask.unsqueeze(1).expand_as(m1_feature).bool()
-            m2_feature_masked = m2_Mask.unsqueeze(1).expand_as(m2_feature).bool()
-            eps = torch.zeros(1, dtype=m1_feature.dtype, device=m1_feature.device)
-            m1_feature = torch.where(m1_feature_masked , m1_feature, eps)
-            m2_feature = torch.where(m2_feature_masked , m2_feature, eps)
+            # m1_feature_masked = m1_Mask.unsqueeze(1).expand_as(m1_feature).bool()
+            # m2_feature_masked = m2_Mask.unsqueeze(1).expand_as(m2_feature).bool()
+            # eps = torch.zeros(1, dtype=m1_feature.dtype, device=m1_feature.device)
+            # m1_feature = torch.where(m1_feature_masked , m1_feature, eps)
+            # m2_feature = torch.where(m2_feature_masked , m2_feature, eps)
+            if self.MaskType in ['AME', 'Shapley','AME_attention', 'Random']:
+                self.m1_mask_num += (batch_size - m1_Mask.sum().item())
+                self.m2_mask_num += (batch_size - m2_Mask.sum().item())
+        
+                m1_feature_masked = m1_Mask.unsqueeze(1).expand_as(m1_feature).bool()
+                m2_feature_masked = m2_Mask.unsqueeze(1).expand_as(m2_feature).bool()
+                eps = torch.zeros(1, dtype=m1_feature.dtype, device=m1_feature.device)
+                m1_feature = torch.where(m1_feature_masked , m1_feature, eps)
+                m2_feature = torch.where(m2_feature_masked , m2_feature, eps)
+            elif self.MaskType == 'AME_attention':
+                mask1_view = m1_Mask.view(-1, *([1]*(m1_feature.dim()-1)))
+                mask2_view = m2_Mask.view(-1, *([1]*(m2_feature.dim()-1)))
+                m1_feature = m1_feature * mask1_view
+                m2_feature = m2_feature * mask2_view
+            
     
             # 仅训练阶段会打印值
             if epoch_index == 0 and epoch != -1:
@@ -172,10 +345,16 @@ class ConcatFusion(base_model):
         self.args = args
         
         self.fusion_classifier = nn.Sequential(
-            nn.Linear(self.unified_dim * 2, 64),
+            nn.Linear(self.unified_dim*2, 64),
             nn.SiLU(),
             nn.Linear(64, self.outdim)
         )
+        # self.fusion_classifier = nn.Sequential(
+        #     nn.Linear(self.unified_dim * 2, self.outdim),
+        #     nn.SiLU()
+        #     # nn.SiLU(),
+        #     # nn.Linear(64, self.outdim)
+        # )
 
     def forward(self, 
                 m1_feature, 
@@ -206,16 +385,29 @@ class ConcatFusion(base_model):
         #         fusion_out = self.fusion_classifier(fusion_feature)
         #     m1_feature,m2_feature,m1_Mask,m2_Mask = self.AME_MASK(epoch, batch_size, m1_feature, m2_feature, device, labels, epoch_index, fusion_logits=fusion_out, sid=sid)
                 # 缓存特征用于可视化
-        self.cached_m1_feature = m1_feature.detach().clone()
-        self.cached_m2_feature = m2_feature.detach().clone()
-        self.cached_fusion_feature = torch.cat((m1_feature, m2_feature), dim=-1).detach().clone()
-        
-        m1_feature,m2_feature,m1_Mask,m2_Mask = self.AME_MASK(epoch, batch_size, m1_feature, m2_feature, device, labels, epoch_index, sid=sid)
-        fusion_feature = torch.cat((m1_feature, m2_feature), dim=-1)  # 在特征维度上拼接
-        fusion_out = self.fusion_classifier(fusion_feature)
-        # print(f"m2_feature is {m2_feature}")
+        # self.cached_m1_feature = m1_feature.detach().clone()
+        # self.cached_m2_feature = m2_feature.detach().clone()
+        # self.cached_fusion_feature = torch.cat((m1_feature, m2_feature), dim=-1).detach().clone()
+        # print(f"cached_fusion_feature shape is {self.cached_fusion_feature.shape}")
+        # with torch.no_grad():
+        #     fusion_logits = self.fusion_classifier(self.cached_fusion_feature)
+                # print(f"m2_feature is {m2_feature}")
         out_m1 = self.m1_classifier(m1_feature)
         out_m2 = self.m2_classifier(m2_feature)
+        if self.use_OLA:
+            with torch.no_grad():
+                zero_feature = torch.zeros_like(m1_feature)
+                fusion_m1_feature = torch.cat((m1_feature, zero_feature), dim=-1)
+                fusion_m2_feature = torch.cat((zero_feature,m2_feature), dim=-1)
+                m1_only_output = self.fusion_classifier(fusion_m1_feature)
+                m2_only_output = self.fusion_classifier(fusion_m2_feature)
+            m1_feature,m2_feature,m1_Mask,m2_Mask = self.AME_MASK(epoch, batch_size, m1_feature, m2_feature, device, labels, epoch_index, fusion_logits=None,sid=sid,m1_only_output=m1_only_output,m2_only_output=m2_only_output)
+        else:
+            m1_feature,m2_feature,m1_Mask,m2_Mask = self.AME_MASK(epoch, batch_size, m1_feature, m2_feature, device, labels, epoch_index, sid=sid)
+        # m1_feature,m2_feature,m1_Mask,m2_Mask = self.AME_MASK(epoch, batch_size, m1_feature, m2_feature, device, labels, epoch_index, sid=sid)
+        fusion_feature = torch.cat((m1_feature, m2_feature), dim=-1)  # 在特征维度上拼接
+        fusion_out = self.fusion_classifier(fusion_feature)
+
 
         return fusion_out,out_m1,out_m2,m1_Mask,m2_Mask
 
@@ -245,10 +437,20 @@ class SumFusion(base_model):
         elif self.model_name == ["Image","Text"]:
             m1_feature = m1_feature[:,0,:]  # 取CLS token
             m2_feature = m2_feature[:,0,:]  # 取CLS token
+
         m1_feature,m2_feature,m1_Mask,m2_Mask = self.AME_MASK(epoch,batch_size,m1_feature,m2_feature,device,labels,epoch_index)
         out_m1 = self.m1_classifier(m1_feature)
         out_m2 = self.m2_classifier(m2_feature)
         fusion_out = out_m1 + out_m2
+        # if self.use_OLA:
+        #     # print(f"use ola")
+        #     out_m1_new = self.m1_classifier(m1_feature)
+        #     out_m2_new = self.m2_classifier(m2_feature)
+        #     fusion_out = out_m1_new + out_m2_new
+        # else:
+        #     out_m1 = self.m1_classifier(m1_feature)
+        #     out_m2 = self.m2_classifier(m2_feature)
+        #     fusion_out = out_m1 + out_m2
 
         return fusion_out,out_m1,out_m2,m1_Mask,m2_Mask
 
@@ -385,6 +587,23 @@ class TVABaseModel(nn.Module):
         self.outdim = args.num_classes
         self.args = args
         self.model_name = eval(args.model_name)
+
+        # OPM 
+        self.latest_drop_info = None
+        self.opm_controller = None
+        if getattr(args, 'use_opm', False) and len(self.model_name) >= 2:
+            self.opm_controller = ModalityDropper(
+                num_modalities=len(self.model_name),
+                execute_prob=getattr(args, 'opm_execute_prob', 0.7),
+                q_base=getattr(args, 'opm_q_base', 0.5),
+                lam=getattr(args, 'opm_lambda', 0.5),
+                min_keep=getattr(args, 'opm_min_keep', 1),
+                seed=getattr(args, 'opm_seed', 2024),
+            )
+        # Random mask reproducibility: use an isolated CPU RNG stream.
+        self._random_mask_gen = torch.Generator(device='cpu')
+        seed = int(getattr(args, 'random_mask_seed', getattr(args, 'random_seed', 0)))
+        self._random_mask_gen.manual_seed(seed)
         # 注册Mask Number 的buffer
         self.register_buffer('m1_mask_num', torch.tensor(0.0)) # 代表文本类
         self.register_buffer('m2_mask_num', torch.tensor(0.0)) # 代表视觉类
@@ -397,6 +616,8 @@ class TVABaseModel(nn.Module):
             self.Mask = AME(args=args)
         elif self.MaskType == "Shapley":
             self.Mask = Shapley(args=args)
+        elif self.MaskType == "Random":
+            self.Mask = None
         else:
             self.Mask == "None"
         self.ame_gap = args.ame_gap
@@ -428,14 +649,44 @@ class TVABaseModel(nn.Module):
             self.m1_mask_num.zero_()
             self.m2_mask_num.zero_()
             self.m3_mask_num.zero_()
+        drop_info = None
+        if (
+            self.opm_controller is not None
+            and self.training
+            and labels is not None
+        ):
+            raw_features = [m1_feature, m2_feature, m3_feature]
+            with torch.no_grad():
+                logits_for_drop = [
+                    self.m1_classifier(raw_features[0].detach()),
+                    self.m2_classifier(raw_features[1].detach()),
+                    self.m3_classifier(raw_features[2].detach())
+                ]
+            dropped_features, drop_info = self.opm_controller(raw_features, logits_for_drop, labels)
+            m1_feature, m2_feature, m3_feature = dropped_features
+        self.latest_drop_info = drop_info
         m1_Mask =torch.ones(batch_size, device=device)
         m2_Mask =torch.ones(batch_size, device=device)
         m3_Mask =torch.ones(batch_size, device=device)
-        if epoch > self.args.warmup_epoch and self.Mask is not None and epoch%self.ame_gap!=1:
-            with torch.no_grad():
-                m1_only_output = self.m1_classifier(m1_feature)
-                m2_only_output = self.m2_classifier(m2_feature)
-                m3_only_output = self.m3_classifier(m3_feature)
+        if epoch > self.args.warmup_epoch and self.MaskType != "None" and epoch % self.ame_gap != 1:
+            if self.MaskType == 'Random':
+                drop_prob = float(getattr(self.args, 'random_mask_drop_prob', 0.0))
+                masks = _sample_random_modality_masks(
+                    batch_size=batch_size,
+                    num_modalities=3,
+                    drop_prob=drop_prob,
+                    device=device,
+                    dtype=m1_feature.dtype,
+                    generator=self._random_mask_gen,
+                )
+                m1_Mask = masks[:, 0]
+                m2_Mask = masks[:, 1]
+                m3_Mask = masks[:, 2]
+            else:
+                with torch.no_grad():
+                    m1_only_output = self.m1_classifier(m1_feature)
+                    m2_only_output = self.m2_classifier(m2_feature)
+                    m3_only_output = self.m3_classifier(m3_feature)
             if self.MaskType == 'AME':
                 kl_result,IT_gsd = self.Mask(
                                         m1_only_output,
@@ -464,17 +715,18 @@ class TVABaseModel(nn.Module):
                 m1_Mask = m1_Mask.squeeze(1)
                 m2_Mask = m2_Mask.squeeze(1)
                 m3_Mask = m3_Mask.squeeze(1)
-            self.m1_mask_num += (batch_size - m1_Mask.sum().item())
-            self.m2_mask_num += (batch_size - m2_Mask.sum().item())
-            self.m3_mask_num += (batch_size - m3_Mask.sum().item())
-    
-            m1_feature_masked = m1_Mask.unsqueeze(1).expand_as(m1_feature).bool()
-            m2_feature_masked = m2_Mask.unsqueeze(1).expand_as(m2_feature).bool()
-            m3_feature_masked = m3_Mask.unsqueeze(1).expand_as(m3_feature).bool()
-            eps = torch.zeros(1, dtype=m1_feature.dtype, device=m1_feature.device)
-            m1_feature = torch.where(m1_feature_masked , m1_feature, eps)
-            m2_feature = torch.where(m2_feature_masked , m2_feature, eps)
-            m3_feature = torch.where(m3_feature_masked , m3_feature, eps)
+            if self.MaskType in ['AME', 'Shapley', 'Random']:
+                self.m1_mask_num += (batch_size - m1_Mask.sum().item())
+                self.m2_mask_num += (batch_size - m2_Mask.sum().item())
+                self.m3_mask_num += (batch_size - m3_Mask.sum().item())
+        
+                m1_feature_masked = m1_Mask.unsqueeze(1).expand_as(m1_feature).bool()
+                m2_feature_masked = m2_Mask.unsqueeze(1).expand_as(m2_feature).bool()
+                m3_feature_masked = m3_Mask.unsqueeze(1).expand_as(m3_feature).bool()
+                eps = torch.zeros(1, dtype=m1_feature.dtype, device=m1_feature.device)
+                m1_feature = torch.where(m1_feature_masked , m1_feature, eps)
+                m2_feature = torch.where(m2_feature_masked , m2_feature, eps)
+                m3_feature = torch.where(m3_feature_masked , m3_feature, eps)
     
             if epoch_index == 0:
                 print(f"{self.model_name[0]} mask_num is {self.m1_mask_num.item()}, {self.model_name[1]}_mask_num is {self.m2_mask_num.item()}, {self.model_name[2]}_mask_num is {self.m3_mask_num.item()}")
@@ -1299,9 +1551,6 @@ class CentralNetFusion(base_model):
         out_m2 = self.m2_classifier(m2_global)
         
         return fusion_out, out_m1, out_m2, m1_Mask, m2_Mask
-
-
-
 
 
 

@@ -329,14 +329,18 @@ class VA_Classifier(nn.Module):
         # print(f"modality_idx is {modality_idx}")
         # print(f"m1_feature is {m1_feature}")
         # print(f"m2_feature is {m2_feature}")
-        fusion_out,out_1,out_2,m1_mask,m2_mask = self.fusion_model(m1_feature, 
-                                                                   m2_feature,
-                                                                   epoch=epoch,
-                                                                   epoch_index=epoch_index,
-                                                                   labels=labels,
-                                                                   sid=sid,
-                                                                  )
-        return fusion_out,out_1,out_2,m1_mask,m2_mask
+        outputs = self.fusion_model(m1_feature, 
+                                   m2_feature,
+                                   epoch=epoch,
+                                   epoch_index=epoch_index,
+                                   labels=labels,
+                                   sid=sid,
+                                  )
+        drop_info = getattr(self.fusion_model, 'latest_drop_info', None)
+        if drop_info is not None:
+            outputs = (*outputs, drop_info)
+        return outputs
+        # return fusion_out,out_1,out_2,m1_mask,m2_mask
 
 
 class TVA_Classifier(nn.Module):
@@ -456,15 +460,27 @@ class TVA_Classifier(nn.Module):
         elif modality_idx == 3:
             m1_feature = torch.zeros_like(m1_feature)
             m2_feature = torch.zeros_like(m2_feature)
-        fusion_out,out_1,out_2,out_3,m1_mask,m2_mask,m3_mask = self.fusion_model(m1_feature, 
-                                                                                 m2_feature,
-                                                                                 m3_feature,
-                                                                                 epoch=epoch,
-                                                                                 epoch_index=epoch_index,
-                                                                                 labels=labels,
-                                                                                 sid=sid,
-                                                                                )
-        return fusion_out,out_1,out_2,out_3,m1_mask,m2_mask,m3_mask
+        outputs = self.fusion_model(m1_feature, 
+                                    m2_feature,
+                                    m3_feature,
+                                    epoch=epoch,
+                                    epoch_index=epoch_index,
+                                    labels=labels,
+                                    sid=sid,
+                                   )
+        drop_info = getattr(self.fusion_model, 'latest_drop_info', None)
+        if drop_info is not None:
+            outputs = (*outputs, drop_info)
+        return outputs
+        # fusion_out,out_1,out_2,out_3,m1_mask,m2_mask,m3_mask = self.fusion_model(m1_feature, 
+        #                                                                          m2_feature,
+        #                                                                          m3_feature,
+        #                                                                          epoch=epoch,
+        #                                                                          epoch_index=epoch_index,
+        #                                                                          labels=labels,
+        #                                                                          sid=sid,
+        #                                                                         )
+        # return fusion_out,out_1,out_2,out_3,m1_mask,m2_mask,m3_mask
 
 
 # MLA version
