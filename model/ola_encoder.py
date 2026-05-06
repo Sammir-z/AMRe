@@ -268,6 +268,7 @@ class OLA_Classifier(nn.Module):
         T_class_hidden = torch.stack(T_class_hidden)
         v_class_hidden = torch.stack(v_class_hidden)
         return T_class_hidden,v_class_hidden
+    
     def get_features_av(self, av_files, mode="train"):
         
         a_class_hidden = []
@@ -372,16 +373,8 @@ class OLA_Classifier(nn.Module):
                 sid=None,
                 mode="train",
                ):
-        if self.dataset == "CREMAD" or self.dataset == "AVE":
-            av_files = sid
-            m1_feature, m2_feature = self.get_features_av(av_files, mode)
-        elif self.dataset == "MVSA":
-            av_files = datas
-            m1_feature, m2_feature = self.get_feature_IT(av_files, mode)
-
-            m1_feature = m1_feature.unsqueeze(1)
-            m2_feature = m2_feature.unsqueeze(1)
-
+        av_files = sid
+        m1_feature, m2_feature = self.get_features_av(av_files, mode)
         outputs = self.fusion_model(m1_feature.float(), 
                                     m2_feature.float(),
                                     epoch=epoch,

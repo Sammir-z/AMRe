@@ -2,39 +2,25 @@
 # All fusion methods to be tested
 # FUSIONS=("concat" "sum" "Gate" "Film" "CA" "MMTM" "CentralNet")
 FUSIONS=("concat")
-# FUSION="concat"
-FUSION="sum"
+FUSION="concat"
 LR_F=1e-3
 LR_T=1e-3
-# Base Encoder
 LR_V=1e-3
 LR_A=1e-3
 
 
-# # # Data set 
-
-
-# # AVE
-# EPOCH=100
-# DATASET=AVE
-# MODEL_NAME='["Visual","Audio"]'
-# ALPHA=2
-# LR_DE_ST=30
-# LR_DE_RA=0.5
-# AME_BETA=0.7
-# AME_GAMA=0.15
-# AME_GAP=3
-
-# MVSA
-EPOCH=60
-DATASET=MVSA
-MODEL_NAME='["Image","Text"]'
+# # Data set 
+# AVE
+EPOCH=100
+DATASET=AVE
+MODEL_NAME='["Visual","Audio"]'
 ALPHA=2
 LR_DE_ST=30
 LR_DE_RA=0.5
 AME_BETA=0.7
-AME_GAMA=0.1
-AME_GAP=2
+AME_GAMA=0.15
+AME_GAP=3
+
 
 UNIFIED_DIM=3584
 WEIGHT_DECAY=5e-4
@@ -45,17 +31,6 @@ OPTMIZER='Adamw'
 METRIC="ce_loss"
 BATCH_SIZE=64
 for FUSION in "${FUSIONS[@]}"; do
-# for AME_BETA in "${AME_BETAS[@]}"; do
-    # Dynamically generate the save directory name of "fusion method + AME" (e.g., concat_AME, sum_AME)
-    SAVE_NAME="${FUSION}_AME"
-    
-    # ======================================
-    # 1. Do not use AME (MaskType=None)
-    # ======================================
-    echo -e "\n=================================================="
-    echo "🔧 Starting execution: Fusion method = $FUSION | AME not used"
-    echo "📁 Model save path: ./checkpoint/$DATASET/$FUSION"
-    echo "=================================================="
     
     CUDA_VISIBLE_DEVICES=0 python -u ./train_all_OLA.py \
         --random_seed $RANDOM_SEED \
@@ -83,7 +58,7 @@ for FUSION in "${FUSIONS[@]}"; do
         --ame_gap $AME_GAP \
         --Use_OLA True \
 
-
+    SAVE_NAME="${FUSION}_AME"
     CUDA_VISIBLE_DEVICES=0 python -u ./train_all_OLA.py \
         --random_seed $RANDOM_SEED \
         --dataset $DATASET \
